@@ -1,0 +1,227 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  checks: write
+  packages: write
+
+jobs:
+  detect:
+    name: Detect Project
+    runs-on: ubuntu-latest
+    outputs:
+      project_type: ${{ steps.detect.outputs.project_type }}
+      project_dir: ${{ steps.detect.outputs.project_dir }}
+      junit_glob: ${{ steps.detect.outputs.junit_glob }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect project type
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -f "package.json" ]]; then
+            echo "project_type=angular" >> "$GITHUB_OUTPUT"
+            echo "junit_glob=reports/**/*.xml" >> "$GITHUB_OUTPUT"
+            echo "project_dir=." >> "$GITHUB_OUTPUT"
+            echo "Detected Angular project"
+          elif [[ -f "build.gradle" || -f "build.gradle.kts" ]]; then
+            echo "project_type=java" >> "$GITHUB_OUTPUT"
+            echo "junit_glob=build/test-results/test/**/*.xml" >> "$GITHUB_OUTPUT"
+            echo "project_dir=." >> "$GITHUB_OUTPUT"
+            echo "Detected Java project"
+          elif [[ -f "G-rez-l-int-gration-et-la-livraison-continue-Application-Angular/package.json" ]]; then
+            echo "project_type=angular" >> "$GITHUB_OUTPUT"
+            echo "project_dir=G-rez-l-int-gration-et-la-livraison-continue-Application-Angular" >> "$GITHUB_OUTPUT"
+            echo "junit_glob=G-rez-l-int-gration-et-la-livraison-continue-Application-Angular/reports/**/*.xml" >> "$GITHUB_OUTPUT"
+            echo "Detected Angular project in subdirectory"
+          elif [[ -f "G-rez-l-int-gration-et-la-livraison-continue-Application-Java/build.gradle" || -f "G-rez-l-int-gration-et-la-livraison-continue-Application-Java/build.gradle.kts" ]]; then
+            echo "project_type=java" >> "$GITHUB_OUTPUT"
+            echo "project_dir=G-rez-l-int-gration-et-la-livraison-continue-Application-Java" >> "$GITHUB_OUTPUT"
+            echo "junit_glob=G-rez-l-int-gration-et-la-livraison-continue-Application-Java/build/test-results/test/**/*.xml" >> "$GITHUB_OUTPUT"
+            echo "Detected Java project in subdirectory"
+          else
+            echo "Unsupported project type: expected package.json or build.gradle at repo root"
+            exit 1
+          fi
+
+  test:
+    name: Detect Project And Run Tests
+    needs: detect
+    runs-on: ubuntu-latest
+    env:
+      CI: "true"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        if: needs.detect.outputs.project_type == 'angular'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install Angular dependencies
+        if: needs.detect.outputs.project_type == 'angular'
+        shell: bash
+        working-directory: ${{ needs.detect.outputs.project_dir }}
+        run: npm ci --cache .npm --prefer-offline
+
+      - name: Run Angular tests
+        if: needs.detect.outputs.project_type == 'angular'
+        shell: bash
+        working-directory: ${{ needs.detect.outputs.project_dir }}
+        run: npm test -- --watch=false
+
+      - name: Setup Java
+        if: needs.detect.outputs.project_type == 'java'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      - name: Ensure Gradle wrapper executable
+        if: needs.detect.outputs.project_type == 'java'
+        shell: bash
+        working-directory: ${{ needs.detect.outputs.project_dir }}
+        run: chmod +x ./gradlew
+
+      - name: Run Java tests
+        if: needs.detect.outputs.project_type == 'java'
+        shell: bash
+        working-directory: ${{ needs.detect.outputs.project_dir }}
+        run: ./gradlew clean test --no-daemon
+
+      - name: Upload JUnit XML artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-${{ needs.detect.outputs.project_type }}
+          path: ${{ needs.detect.outputs.junit_glob }}
+          if-no-files-found: warn
+
+      - name: Publish test report
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: Test Results (${{ needs.detect.outputs.project_type }})
+          path: ${{ needs.detect.outputs.junit_glob }}
+          reporter: java-junit
+          fail-on-error: false
+
+  build:
+    name: Build And Push Docker Image
+    needs: [detect, test]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare image variables
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch_slug="${GITHUB_REF_NAME//\//-}"
+          repo_lc="${GITHUB_REPOSITORY,,}"
+          image="ghcr.io/${repo_lc}"
+          echo "branch_slug=${branch_slug}" >> "$GITHUB_OUTPUT"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ needs.detect.outputs.project_dir }}
+          file: ${{ needs.detect.outputs.project_dir }}/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.branch_slug }}-${{ github.sha }}
+            ${{ steps.vars.outputs.image }}:sha-${{ github.sha }}
+
+  release:
+    name: Semantic Release
+    needs: [detect, test]
+    if: github.event_name == 'push' && (github.ref_name == 'main' || github.ref_name == 'master')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node for semantic-release
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run semantic-release
+        id: semantic
+        uses: cycjimmy/semantic-release-action@v4
+        with:
+          working_directory: ${{ needs.detect.outputs.project_dir }}
+          extra_plugins: |
+            @semantic-release/commit-analyzer
+            @semantic-release/release-notes-generator
+            @semantic-release/changelog
+            @semantic-release/git
+            @semantic-release/github
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare release image variables
+        if: steps.semantic.outputs.new_release_published == 'true'
+        id: release_vars
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo_lc="${GITHUB_REPOSITORY,,}"
+          image="ghcr.io/${repo_lc}"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        if: steps.semantic.outputs.new_release_published == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: steps.semantic.outputs.new_release_published == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push release image
+        if: steps.semantic.outputs.new_release_published == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ needs.detect.outputs.project_dir }}
+          file: ${{ needs.detect.outputs.project_dir }}/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.release_vars.outputs.image }}:${{ steps.semantic.outputs.new_release_version }}
+            ${{ steps.release_vars.outputs.image }}:latest
